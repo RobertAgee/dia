@@ -5,6 +5,7 @@ import time
 import random
 import io
 import contextlib
+import torch_tensorrt
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -41,26 +42,26 @@ print(f"Using device: {device}")
 # Load Nari model and config
 print("Loading Nari model...")
 try:
-    # Step 1: Load model normally
     model = Dia.from_pretrained(
-        "RobAgrees/quantized-dia-1.6B-int8",
+        "nari-labs/Dia-1.6B",
         compute_dtype="float16",
         device=device
     )
 
-    # Step 2: Apply dynamic quantization
-    quantized_model = torch.quantization.quantize_dynamic(
-        model.model,
-        {torch.nn.Linear, torch.nn.LSTM},
-        dtype=torch.qint8
+    # Compile model with TensorRT
+    print("Compiling model with TensorRT...")
+    model.model = torch_tensorrt.compile(
+        model.model.eval().to(device),
+        inputs=[torch_tensorrt.Input(
+            min_shape=(1, 16, 1024),
+            opt_shape=(1, 64, 1024),
+            max_shape=(1, 256, 1024),
+            dtype=torch.float16,
+        )],
+        enabled_precisions={torch.float16},
+        workspace_size=1 << 22
     )
-
-    # Step 3: Dereference the original
-    model.model = None
-    torch.cuda.empty_cache()
-
-    # Step 4: Replace with quantized
-    model.model = quantized_model
+    print("TensorRT compilation complete.")
 
 except Exception as e:
     print(f"Error loading Nari model: {e}")
