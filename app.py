@@ -5,7 +5,7 @@ import time
 import random
 import io
 import contextlib
-import torch_tensorrt
+# import torch_tensorrt
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -48,20 +48,20 @@ try:
         device=device
     )
 
-    # Compile model with TensorRT
-    print("Compiling model with TensorRT...")
-    model.model = torch_tensorrt.compile(
-        model.model.eval().to(device),
-        inputs=[torch_tensorrt.Input(
-            min_shape=(1, 16, 1024),
-            opt_shape=(1, 64, 1024),
-            max_shape=(1, 256, 1024),
-            dtype=torch.float16,
-        )],
-        enabled_precisions={torch.float16},
-        workspace_size=1 << 22
-    )
-    print("TensorRT compilation complete.")
+    # # Compile model with TensorRT
+    # print("Compiling model with TensorRT...")
+    # model.model = torch_tensorrt.compile(
+    #     model.model.eval().to(device),
+    #     inputs=[torch_tensorrt.Input(
+    #         min_shape=(1, 16, 1024),
+    #         opt_shape=(1, 64, 1024),
+    #         max_shape=(1, 256, 1024),
+    #         dtype=torch.float16,
+    #     )],
+    #     enabled_precisions={torch.float16},
+    #     workspace_size=1 << 22
+    # )
+    # print("TensorRT compilation complete.")
 
 except Exception as e:
     print(f"Error loading Nari model: {e}")
@@ -188,7 +188,7 @@ def run_inference(
 
                     print(f"Generating chunk {idx+1}/{len(chunks)} ({num_lines} lines, {adjusted_tokens} tokens)...")
 
-                    with torch.inference_mode():
+                    with torch.inference_mode(), torch.cuda.amp.autocast(dtype=torch.float16):
                         generated_chunk_audio = model.generate(
                             chunk_input,
                             max_tokens=adjusted_tokens,
