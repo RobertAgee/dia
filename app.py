@@ -220,7 +220,7 @@ def run_inference(
                 # Use last generated audio + text as next prompt
                 if batch_idx > 0 and previous_audio_np is not None:
                     with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as f_prev:
-                        sf.write(f_prev.name, previous_audio_np, 44100, subtype="FLOAT")
+                        sf.write(f_prev.name, previous_audio_np.astype(np.float32), 44100, subtype="FLOAT")
                         prompt_path_for_generate = f_prev.name
                         audio_prompt_text_input = previous_text_batch
                         temp_files.append(f_prev.name)
