@@ -152,23 +152,17 @@ def run_inference(
     chunk_size: int,
     seed: Optional[int] = None,
 ):
-    """
-    Runs Nari inference using the globally loaded model and provided inputs.
-    Supports dynamic chunking and token scaling.
-    """
-
-    global model, device  # Access global model, config, device
+    import tempfile
+    global model, device
     console_output_buffer = io.StringIO()
 
     with contextlib.redirect_stdout(console_output_buffer):
-        # Validation
         if not text_input or text_input.isspace():
             raise gr.Error("Text input cannot be empty.")
 
         if audio_prompt_input and (not audio_prompt_text_input or audio_prompt_text_input.isspace()):
             raise gr.Error("Audio Prompt Text input cannot be empty.")
 
-        # Set and Display Generation Seed
         if seed is None or seed < 0:
             seed = random.randint(0, 2**32 - 1)
             print(f"\nNo seed provided, generated random seed: {seed}\n")
@@ -176,28 +170,23 @@ def run_inference(
             print(f"\nUsing user-selected seed: {seed}\n")
         set_seed(seed)
 
-        # Preprocess audio prompt
         temp_audio_prompt_path = None
-        output_audio = (44100, np.zeros(1, dtype=np.float32))
         prompt_path_for_generate = None
+        audio_segments = []
+        previous_audio_np = None
+        previous_text_batch = ""
+        temp_files = []
 
         try:
             if audio_prompt_input is not None:
                 sr, audio_data = audio_prompt_input
-                if audio_data is None or audio_data.size == 0 or audio_data.max() == 0:
-                    gr.Warning("Audio prompt seems empty or silent, ignoring prompt.")
-                else:
+                if audio_data is not None and audio_data.size > 0 and audio_data.max() > 0:
                     with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as f_audio:
                         temp_audio_prompt_path = f_audio.name
-
                         if np.issubdtype(audio_data.dtype, np.integer):
-                            max_val = np.iinfo(audio_data.dtype).max
-                            audio_data = audio_data.astype(np.float32) / max_val
+                            audio_data = audio_data.astype(np.float32) / np.iinfo(audio_data.dtype).max
                         elif not np.issubdtype(audio_data.dtype, np.floating):
-                            try:
-                                audio_data = audio_data.astype(np.float32)
-                            except Exception as conv_e:
-                                raise gr.Error(f"Failed to convert audio prompt: {conv_e}")
+                            audio_data = audio_data.astype(np.float32)
 
                         if audio_data.ndim > 1:
                             audio_data = np.mean(audio_data, axis=-1)
@@ -205,36 +194,38 @@ def run_inference(
 
                         sf.write(temp_audio_prompt_path, audio_data, sr, subtype="FLOAT")
                         prompt_path_for_generate = temp_audio_prompt_path
-                        print(f"Created temporary audio prompt file: {temp_audio_prompt_path} (orig sr: {sr})")
+                        print(f"Created initial audio prompt: {temp_audio_prompt_path}")
+                        temp_files.append(temp_audio_prompt_path)
 
-            # --- Chunking ---
             chunk_size = auto_adjust_chunk_size(text_input, chunk_size)
             print(f"Auto-selected chunk size: {chunk_size} effective characters per chunk.")
-            # New: Split by effective character count (~64 chars per chunk)
             chunks = split_by_words_respecting_special_tokens(text_input, max_effective_chars=chunk_size)
-
-            print(f"Chunked into {len(chunks)} chunks (based on effective character count).")
-
-            audio_segments = []
+            print(f"Chunked into {len(chunks)} chunks.")
 
             start_time = time.time()
-
-            batch_size = 4  # Adjust based on your GPU VRAM (e.g., 2–8)
+            batch_size = 4
 
             for batch_idx, chunk_batch in enumerate(batch_chunks(chunks, batch_size)):
-                print(
-                    f"Generating batch {batch_idx + 1}/{(len(chunks) + batch_size - 1) // batch_size} with {len(chunk_batch)} chunks...")
+                print(f"Generating batch {batch_idx + 1}/{(len(chunks) + batch_size - 1) // batch_size}")
 
                 batch_input_text = "\n".join(chunk.strip() for chunk in chunk_batch).strip()
-
                 if not batch_input_text:
-                    raise gr.Error("All chunks in this batch were empty after trimming. Cannot generate.")
+                    raise gr.Error("All chunks in this batch were empty after trimming.")
+
+                # Dynamically adjust token length
                 effective_chars = count_effective_length(batch_input_text)
                 scaling_factor = effective_chars / chunk_size
-                adjusted_tokens = int(max_new_tokens * scaling_factor)
-                adjusted_tokens = max(256, adjusted_tokens)
+                adjusted_tokens = max(256, int(max_new_tokens * scaling_factor))
 
-                with torch.inference_mode(), torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                # Use last generated audio + text as next prompt
+                if batch_idx > 0 and previous_audio_np is not None:
+                    with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as f_prev:
+                        sf.write(f_prev.name, previous_audio_np, 44100, subtype="FLOAT")
+                        prompt_path_for_generate = f_prev.name
+                        audio_prompt_text_input = previous_text_batch
+                        temp_files.append(f_prev.name)
+
+                with torch.inference_mode(), torch.amp.autocast(device_type=device.type, dtype=torch.float16):
                     generated_batch_audio = model.generate(
                         batch_input_text,
                         max_tokens=adjusted_tokens,
@@ -249,12 +240,11 @@ def run_inference(
 
                 if generated_batch_audio is not None:
                     audio_segments.append(generated_batch_audio)
+                    previous_audio_np = generated_batch_audio
+                    previous_text_batch = batch_input_text
 
-                    # Add a small silence buffer **after the batch** (but NOT after the last batch)
                     if batch_idx < (len(chunks) + batch_size - 1) // batch_size - 1:
-                        silence_duration_sec = 0.2
-                        silence_samples = int(44100 * silence_duration_sec)
-                        silence = np.zeros(silence_samples, dtype=np.float32)
+                        silence = np.zeros(int(44100 * 0.2), dtype=np.float32)
                         audio_segments.append(silence)
 
             if not audio_segments:
@@ -263,36 +253,24 @@ def run_inference(
                 output_audio_np = np.concatenate(audio_segments)
 
             end_time = time.time()
-            print(f"Generation finished in {end_time - start_time:.2f} seconds.\n")
+            print(f"Generation completed in {end_time - start_time:.2f} seconds.")
 
-            # --- Postprocessing ---
+            output_sr = 44100
             if output_audio_np is not None:
-                output_sr = 44100
-
-                # Slowdown if needed
                 original_len = len(output_audio_np)
-                speed_factor = max(0.1, min(speed_factor, 5.0))
-                target_len = int(original_len / speed_factor)
+                target_len = int(original_len / max(0.1, min(speed_factor, 5.0)))
 
                 if target_len != original_len and target_len > 0:
                     x_original = np.arange(original_len)
                     x_resampled = np.linspace(0, original_len - 1, target_len)
                     resampled_audio_np = np.interp(x_resampled, x_original, output_audio_np)
-                    output_audio = (output_sr, resampled_audio_np.astype(np.float32))
-                    print(f"Resampled audio from {original_len} to {target_len} samples for {speed_factor:.2f}x speed.")
+                    output_audio = (output_sr, (resampled_audio_np * 32767).astype(np.int16))
+                    print(f"Speed-adjusted from {original_len} to {target_len} samples.")
                 else:
-                    output_audio = (output_sr, output_audio_np)
-                    print(f"Skipping audio speed adjustment (factor: {speed_factor:.2f}).")
-
-                # Final output conversion
-                if output_audio[1].dtype in (np.float32, np.float64):
-                    audio_for_gradio = np.clip(output_audio[1], -1.0, 1.0)
-                    audio_for_gradio = (audio_for_gradio * 32767).astype(np.int16)
-                    output_audio = (output_sr, audio_for_gradio)
-                    print("Converted audio to int16 for Gradio output.")
+                    output_audio = (output_sr, (output_audio_np * 32767).astype(np.int16))
             else:
-                print("\nGeneration finished, but no valid tokens were produced.")
-                gr.Warning("Generation produced no output.")
+                gr.Warning("No audio generated.")
+                output_audio = (44100, np.zeros(1, dtype=np.int16))
 
         except Exception as e:
             print(f"Error during inference: {e}")
@@ -301,25 +279,18 @@ def run_inference(
             raise gr.Error(f"Inference failed: {e}")
 
         finally:
-            # Clean up temp files
-            if temp_audio_prompt_path and Path(temp_audio_prompt_path).exists():
+            for path in temp_files:
                 try:
-                    Path(temp_audio_prompt_path).unlink()
-                    print(f"Deleted temporary audio prompt file: {temp_audio_prompt_path}")
+                    Path(path).unlink()
+                    print(f"Deleted temp file: {path}")
                 except Exception as cleanup_e:
-                    print(f"Warning: Error deleting temporary audio prompt file: {cleanup_e}")
+                    print(f"Warning during cleanup: {cleanup_e}")
 
         console_output = console_output_buffer.getvalue()
-
-    try:
         torch.cuda.empty_cache()
         gc.collect()
-    except:
-        print("No cache to clear or garbage to collect")
-    finally:
-        print("Generation completed")
+        return output_audio, seed, console_output
 
-    return output_audio, seed, console_output
 
 
 # --- Create Gradio Interface ---
