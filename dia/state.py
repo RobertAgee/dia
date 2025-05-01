@@ -82,7 +82,7 @@ class KVCache:
     ):
         self.k = torch.zeros((2, num_heads, max_len, head_dim), dtype=dtype, device=device) if k is None else k
         self.v = torch.zeros((2, num_heads, max_len, head_dim), dtype=dtype, device=device) if v is None else v
-        self.current_idx = torch.tensor(0)
+        self.current_idx = 0
 
     @classmethod
     def from_kv(cls, k: torch.Tensor, v: torch.Tensor) -> "KVCache":
@@ -135,7 +135,7 @@ class DecoderInferenceState:
         device = enc_out.device
         max_audio_len = config.data.audio_length
 
-        dec_positions = torch.full((2, 1), fill_value=0, dtype=torch.long, device=device)
+        dec_positions = torch.full((2, 1), fill_value=0, dtype=torch.int32, device=device)
         tgt_padding_mask = torch.ones((2, 1), dtype=torch.bool, device=device)
         dec_cross_attn_mask = create_attn_mask(tgt_padding_mask, enc_state.padding_mask, device, is_causal=False)
 
@@ -165,7 +165,7 @@ class DecoderInferenceState:
         if step_to is None:
             step_to = step_from + 1
         self.dec_positions = (
-            torch.arange(step_from, step_to, dtype=torch.float32, device=self.device).unsqueeze(0).expand(2, -1)
+            torch.arange(step_from, step_to, dtype=torch.int32, device=self.device).unsqueeze(0).expand(2, -1)
         )
 
 
@@ -193,6 +193,7 @@ class DecoderOutput:
         return self.generated_tokens[step_from:step_to, :]
 
     def update_one(self, dec_out: torch.Tensor, step: int, apply_mask: bool = False):
+        dec_out = dec_out.to(self.generated_tokens.dtype)
         if apply_mask:
             mask = self.generated_tokens[step : step + 1, :] == -1
             self.generated_tokens[step : step + 1, :] = torch.where(

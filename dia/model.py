@@ -37,7 +37,7 @@ def _sample_next_token(
     if cfg_filter_top_k is not None:
         _, top_k_indices_BCxV = torch.topk(logits_BCxV, k=cfg_filter_top_k, dim=-1)
         mask = torch.ones_like(logits_BCxV, dtype=torch.bool)
-        mask.scatter_(dim=-1, index=top_k_indices_BCxV, value=False)
+        mask = mask.scatter(dim=-1, index=top_k_indices_BCxV, value=False)
         logits_BCxV = logits_BCxV.masked_fill(mask, -torch.inf)
 
     if top_p < 1.0:
@@ -46,11 +46,11 @@ def _sample_next_token(
         cumulative_probs_BCxV = torch.cumsum(sorted_probs_BCxV, dim=-1)
 
         sorted_indices_to_remove_BCxV = cumulative_probs_BCxV > top_p
-        sorted_indices_to_remove_BCxV[..., 1:] = sorted_indices_to_remove_BCxV[..., :-1].clone()
-        sorted_indices_to_remove_BCxV[..., 0] = 0
+        sorted_indices_to_remove_BCxV = torch.roll(sorted_indices_to_remove_BCxV, shifts=1, dims=-1)
+        sorted_indices_to_remove_BCxV[..., 0] = torch.zeros_like(sorted_indices_to_remove_BCxV[..., 0])
 
         indices_to_remove_BCxV = torch.zeros_like(sorted_indices_to_remove_BCxV)
-        indices_to_remove_BCxV.scatter_(dim=-1, index=sorted_indices_BCxV, src=sorted_indices_to_remove_BCxV)
+        indices_to_remove_BCxV = indices_to_remove_BCxV.scatter(dim=-1, index=sorted_indices_BCxV, src=sorted_indices_to_remove_BCxV)
         logits_BCxV = logits_BCxV.masked_fill(indices_to_remove_BCxV, -torch.inf)
 
     final_probs_BCxV = torch.softmax(logits_BCxV, dim=-1)
@@ -98,8 +98,11 @@ class Dia:
         if isinstance(compute_dtype, str):
             compute_dtype = ComputeDtype(compute_dtype)
         self.compute_dtype = compute_dtype.to_dtype()
-        self.model = DiaModel(config, self.compute_dtype)
+        self.model: DiaModel = DiaModel(config, self.compute_dtype)
         self.dac_model = None
+
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
 
     @classmethod
     def from_local(
@@ -196,19 +199,17 @@ class Dia:
         text_tokens = list(replaced_bytes)
 
         current_len = len(text_tokens)
-        padding_needed = max_len - current_len
-        if padding_needed <= 0:
-            text_tokens = text_tokens[:max_len]
-            padded_text_np = np.array(text_tokens, dtype=np.uint8)
-        else:
-            padded_text_np = np.pad(
-                text_tokens,
-                (0, padding_needed),
-                mode="constant",
-                constant_values=text_pad_value,
-            ).astype(np.uint8)
-
-        src_tokens = torch.from_numpy(padded_text_np).to(torch.long).to(self.device).unsqueeze(0)  # [1, S]
+        src_tokens = torch.full(
+            (1, max_len),
+            fill_value=text_pad_value,
+            dtype=torch.long,
+            device=self.device,
+        )
+        src_tokens[0, :current_len] = torch.tensor(
+            text_tokens[:max_len],
+            dtype=torch.long,
+            device=self.device,
+        )
         return src_tokens
 
     def _prepare_audio_prompt(self, audio_prompt: torch.Tensor | None) -> tuple[torch.Tensor, int]:
@@ -217,6 +218,15 @@ class Dia:
         audio_pad_value = self.config.data.audio_pad_value
         delay_pattern = self.config.data.delay_pattern
         max_delay_pattern = max(delay_pattern)
+
+        parts = [
+            torch.full(
+                (1, num_channels),
+                fill_value=audio_bos_value,
+                dtype=torch.int,
+                device=self.device,
+            )
+        ]
 
         prefill = torch.full(
             (1, num_channels),
@@ -229,12 +239,13 @@ class Dia:
 
         if audio_prompt is not None:
             prefill_step += audio_prompt.shape[0]
-            prefill = torch.cat([prefill, audio_prompt], dim=0)
+            parts.append(audio_prompt)
 
         delay_pad_tensor = torch.full(
             (max_delay_pattern, num_channels), fill_value=-1, dtype=torch.int, device=self.device
         )
-        prefill = torch.cat([prefill, delay_pad_tensor], dim=0)
+        parts.append(delay_pad_tensor)
+        prefill = torch.cat(parts, dim=0)
 
         delay_precomp = build_delay_indices(
             B=1,
@@ -294,16 +305,22 @@ class Dia:
         audio_eos_value = self.config.data.audio_eos_value
         logits_Bx1xCxV = self.model.decoder.decode_step(tokens_Bx1xC, dec_state)
 
-        logits_last_BxCxV = logits_Bx1xCxV[:, -1, :, :]
-        uncond_logits_CxV = logits_last_BxCxV[0, :, :]
-        cond_logits_CxV = logits_last_BxCxV[1, :, :]
+        logits_last_BxCxV = logits_Bx1xCxV[:, -1]
+        uncond_logits_CxV = logits_last_BxCxV[0]
+        cond_logits_CxV = logits_last_BxCxV[1]
 
         logits_CxV = cond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
-        logits_CxV[:, audio_eos_value + 1 :] = -torch.inf
-        logits_CxV[1:, audio_eos_value:] = -torch.inf
+        logits_CxV[:, audio_eos_value + 1:] = torch.full_like(
+            logits_CxV[:, audio_eos_value + 1:],
+            fill_value=-torch.inf,
+        )
+        logits_CxV[1:, audio_eos_value:] = torch.full_like(
+            logits_CxV[1:, audio_eos_value:],
+            fill_value=-torch.inf,
+        )
 
         pred_C = _sample_next_token(
-            logits_CxV.float(),
+            logits_CxV.to(dtype=torch.float32),
             temperature=temperature,
             top_p=top_p,
             cfg_filter_top_k=cfg_filter_top_k,
@@ -390,6 +407,12 @@ class Dia:
         if verbose:
             total_start_time = time.time()
 
+        if use_torch_compile and not hasattr(self, "_compiled"):
+            # Compilation can take about a minute.
+            self._prepare_generation = torch.compile(self._prepare_generation, dynamic=True)
+            self._decoder_step = torch.compile(self._decoder_step, fullgraph=True, mode="max-autotune")
+            self._compiled = True
+
         dec_state, dec_output = self._prepare_generation(full_text, audio_prompt, verbose)
         dec_step = dec_output.prefill_step - 1
 
@@ -397,10 +420,6 @@ class Dia:
         eos_detected = False
         eos_countdown = -1
 
-        if use_torch_compile:
-            step_fn = torch.compile(self._decoder_step, mode="default")
-        else:
-            step_fn = self._decoder_step
 
         if verbose:
             print("generate: starting generation loop")
@@ -409,9 +428,10 @@ class Dia:
             start_time = time.time()
 
         while dec_step < max_tokens:
+            torch.compiler.cudagraph_mark_step_begin()
             dec_state.prepare_step(dec_step)
             tokens_Bx1xC = dec_output.get_tokens_at(dec_step).unsqueeze(0).expand(2, -1, -1)
-            pred_C = step_fn(
+            pred_C = self._decoder_step(
                 tokens_Bx1xC,
                 dec_state,
                 cfg_scale,
