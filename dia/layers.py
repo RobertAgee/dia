@@ -248,11 +248,15 @@ class Attention(nn.Module):
                 else:
                     attn_k, attn_v = cache.update(Xk_BxKxSxH, Xv_BxKxSxH)
 
+        # If is_causal is True, sdpa handles masking internally, so attn_mask should be None.
+        # Otherwise, use the provided attn_mask (e.g., for padding in encoder).
+        effective_attn_mask = attn_mask if not is_causal else None
+
         attn_output = F.scaled_dot_product_attention(
             Xq_BxNxTxH,
             attn_k,
             attn_v,
-            attn_mask=attn_mask,
+            attn_mask=effective_attn_mask,
             scale=1.0,
             enable_gqa=self.num_gqa_groups > 1,
             is_causal=is_causal,
