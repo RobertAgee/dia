@@ -161,25 +161,3 @@ def revert_audio_delay(
     result_BxTxC = torch.where(t_idx_BxTxC >= T_tensor, pad_tensor, gathered_BxTxC)  # Changed np.where to torch.where
 
     return result_BxTxC
-
-
-@torch.no_grad()
-@torch.inference_mode()
-def decode(
-    model,
-    audio_codes,
-):
-    """
-    Decodes the given frames into an output audio waveform
-    """
-    if len(audio_codes) != 1:
-        raise ValueError(f"Expected one frame, got {len(audio_codes)}")
-
-    try:
-        audio_values = model.quantizer.from_codes(audio_codes)
-        audio_values = model.decode(audio_values[0])
-
-        return audio_values
-    except Exception as e:
-        print(f"Error in decode method: {str(e)}")
-        raise
