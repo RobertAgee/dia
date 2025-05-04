@@ -1,5 +1,6 @@
 import time
 from enum import Enum
+from typing import Optional
 
 import numpy as np
 import torch
@@ -582,9 +583,10 @@ class Dia:
         temperature: float = 1.2,
         top_p: float = 0.95,
         use_torch_compile: bool = False,
-        cfg_filter_top_k: int = 45,
-        audio_prompt: list[str | torch.Tensor | None] | str | torch.Tensor | None = None,
-        audio_prompt_path: list[str | torch.Tensor | None] | str | torch.Tensor | None = None,
+        cfg_filter_top_k: int = 35,
+        audio_prompt: str | torch.Tensor | None = None,
+        audio_prompt_path: str | None = None,
+        audio_prompt_text: Optional[str] = None,
         use_cfg_filter: bool | None = None,
         verbose: bool = False,
     ) -> np.ndarray | list[np.ndarray]:
@@ -631,6 +633,10 @@ class Dia:
         if audio_prompt_path:
             print("Warning: audio_prompt_path is deprecated. Use audio_prompt instead.")
             audio_prompt = audio_prompt_path
+        if audio_prompt_text:
+            full_text = f"{audio_prompt_text.strip()}\n{text.strip()}"
+        else:
+            full_text = text.strip()
         if use_cfg_filter is not None:
             print("Warning: use_cfg_filter is deprecated.")
 
@@ -660,7 +666,7 @@ class Dia:
             text = [self._encode_text(text)]
         text = self._pad_text_input(text)
 
-        dec_state, dec_output = self._prepare_generation(text, audio_prompt)
+        dec_state, dec_output = self._prepare_generation(text, audio_prompt, verbose)
         dec_step = min(dec_output.prefill_steps) - 1
         current_idx = torch.tensor([dec_step], device=self.device)
 
