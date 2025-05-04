@@ -311,15 +311,15 @@ def run_inference(
 
         console_output = console_output_buffer.getvalue()
 
-    try:
-        torch.cuda.empty_cache()
-        gc.collect()
-    except RuntimeError as e:
-        print(f"CUDA cache clear failed: {e}")
-    except Exception as e:
-        print(f"Garbage collection failed: {e}")
-    finally:
-        print("Generation completed")
+    # try:
+    #     torch.cuda.empty_cache()
+    #     gc.collect()
+    # except RuntimeError as e:
+    #     print(f"CUDA cache clear failed: {e}")
+    # except Exception as e:
+    #     print(f"Garbage collection failed: {e}")
+    # finally:
+    #     print("Generation completed")
 
     return output_audio, seed, console_output
 
